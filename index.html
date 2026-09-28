@@ -1,0 +1,1023 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Smear Transition</title>
+    <style>
+      html,
+      body {
+        margin: 0;
+        height: 100%;
+        overflow: hidden;
+        background: #d7d7d7;
+      }
+      canvas {
+        position: fixed;
+        inset: 0;
+        width: 100vw;
+        height: 100vh;
+        display: block;
+      }
+      #overlay {
+        pointer-events: none;
+      }
+    </style>
+  </head>
+  <body>
+    <canvas id="stage"></canvas>
+    <canvas id="overlay"></canvas>
+    <script>
+      const PHOTOS = [
+        "https://images.unsplash.com/photo-1788521881386-4476c3d7e1da",
+        "https://images.unsplash.com/photo-1782178394093-e853f6411d79",
+        "https://images.unsplash.com/photo-1783682189396-42583d2bddf2",
+        "https://images.unsplash.com/photo-1787058129901-e17f62f96263",
+        "https://images.unsplash.com/photo-1787125587994-079af90b985d",
+        "https://images.unsplash.com/photo-1787672807779-37fe51312683",
+      ];
+      const BG = "#d7d7d7";
+      const IN_S = 0.81;
+      const HOLD_S = 0.5;
+      const OUT_S = 0.81;
+
+      const SIZES = [0.78, 0.89, 1];
+      const PHOTO_HEIGHT = 0.62;
+      const MAX_WIDTH = 0.88;
+
+      const N_COLORS = 7;
+      const SEG_SIZE = 220;
+      const SEG_SPACE = 55;
+      const MAX_PIECES = 28;
+      const MIN_PIECE = 0.012;
+      const USE_OBJECTS = true;
+      const OBJECT_MODEL = "Xenova/detr-resnet-50-panoptic";
+      const OBJECT_LIB =
+        "https://cdn.jsdelivr.net/npm/@huggingface/transformers@4.3.0/dist/transformers.min.js";
+
+      // the smear
+      const STRETCH = 2.3;
+      const PAGE_STRETCH = 3.6;
+      const STRETCH_POW = 1.8;
+      const SLIDE = 0.34;
+      const FAN = 0.03;
+      const WOBBLE = 0.01;
+      const NECK = 0.9;
+      const TAPER = 0.45;
+      const LET_GO = 0.72;
+      const CARRY = 0.9;
+      const ANCHOR = 0.66;
+      const COPY_ALPHA = 0.42;
+      const COPY_STEP = 3;
+      const MAX_COPIES = 90;
+      const STAGGER = 0.45;
+      const TRAVEL = 0.55;
+      const LEAD = [-1.0, -0.42, 0.7, 0.86, -0.7, 0.42, 1.0];
+      const LEAD_SPREAD = 0.5;
+      const LEAD_JITTER = 0.35;
+      const BIAS = [0.85, 0.85, 1.05];
+
+      const TRAIL_KEEP = 0.8;
+      const TRAIL_SETTLE = 0.2;
+      const MASK_RES = 0.55;
+      const FADE_IN = 0.24;
+      const FADE_OUT = 0.92;
+      const FADE_LONG = 2.4;
+      const FADE_WIDE = 3;
+
+      const THINGS = new Set(
+        (
+          "person,bicycle,car,motorcycle,airplane,bus,train,truck,boat,traffic light," +
+          "fire hydrant,stop sign,parking meter,bench,bird,cat,dog,horse,sheep,cow,elephant,bear,zebra," +
+          "giraffe,backpack,umbrella,handbag,tie,suitcase,frisbee,skis,snowboard,sports ball,kite," +
+          "baseball bat,baseball glove,skateboard,surfboard,tennis racket,bottle,wine glass,cup,fork,knife," +
+          "spoon,bowl,banana,apple,sandwich,orange,broccoli,carrot,hot dog,pizza,donut,cake,chair,couch," +
+          "potted plant,bed,dining table,toilet,tv,laptop,mouse,remote,keyboard,cell phone,microwave,oven," +
+          "toaster,sink,refrigerator,book,clock,vase,scissors,teddy bear,hair drier,toothbrush"
+        ).split(","),
+      );
+
+      const clamp = (v, lo, hi) => (v < lo ? lo : v > hi ? hi : v);
+      const smoothstep = (t) => t * t * (3 - 2 * t);
+      const smootherstep = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+
+      function makeCanvas(w, h) {
+        const c = document.createElement("canvas");
+        c.width = w;
+        c.height = h;
+        return c;
+      }
+
+      function sized(url, w) {
+        const u = new URL(url);
+        u.searchParams.set("w", w);
+        u.searchParams.set("auto", "format");
+        u.searchParams.set("q", "80");
+        return u.toString();
+      }
+
+      function seeded(seed) {
+        return () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+      }
+
+      function hash2(x, y) {
+        let n = (x * 374761393 + y * 668265263) | 0;
+        n = Math.imul(n ^ (n >>> 13), 1274126177);
+        return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+      }
+
+      function noise(x, y) {
+        const ix = Math.floor(x),
+          iy = Math.floor(y);
+        const fx = smoothstep(x - ix),
+          fy = smoothstep(y - iy);
+        const a = hash2(ix, iy),
+          b = hash2(ix + 1, iy);
+        const c = hash2(ix, iy + 1),
+          d = hash2(ix + 1, iy + 1);
+        const top = a + (b - a) * fx;
+        return top + (c + (d - c) * fx - top) * fy;
+      }
+
+      function fbm(x, y) {
+        let s = 0,
+          amp = 0.5;
+        for (let o = 0; o < 3; o++) {
+          s += amp * noise(x, y);
+          x *= 2.07;
+          y *= 2.07;
+          amp *= 0.5;
+        }
+        return s / 0.875;
+      }
+
+      const photos = PHOTOS.map((url) => {
+        const p = {
+          img: new Image(),
+          ready: false,
+          seg: null,
+          rawObjects: null,
+          objects: null,
+          cuts: new Map(),
+        };
+        p.img.crossOrigin = "anonymous"; // needed to read the pixels
+        p.img.onload = () => (p.ready = true);
+        p.img.src = sized(url, 1400);
+        return p;
+      });
+
+      function photoRect(img, size) {
+        const aspect = img.naturalWidth / img.naturalHeight;
+        let h = H * PHOTO_HEIGHT * size;
+        let w = h * aspect;
+        if (w > W * MAX_WIDTH) {
+          w = W * MAX_WIDTH;
+          h = w / aspect;
+        }
+        return { x: (W - w) / 2, y: (H - h) / 2, w, h };
+      }
+
+      // Sort the photo into its main colours with k-means. Position counts a little too,
+      // so a colour tends to stay one region. Labels come back ranked dark to light.
+      function segment(img) {
+        const aspect = img.naturalWidth / img.naturalHeight;
+        const gw = Math.max(
+          8,
+          Math.round(aspect >= 1 ? SEG_SIZE : SEG_SIZE * aspect),
+        );
+        const gh = Math.max(
+          8,
+          Math.round(aspect >= 1 ? SEG_SIZE / aspect : SEG_SIZE),
+        );
+        const g = makeCanvas(gw, gh).getContext("2d", {
+          willReadFrequently: true,
+        });
+        g.filter = "blur(1.2px)";
+        g.drawImage(img, 0, 0, gw, gh);
+        let px;
+        try {
+          px = g.getImageData(0, 0, gw, gh).data;
+        } catch {
+          return { gw: 1, gh: 1, labels: new Uint8Array(1), colors: null }; // unreadable: one piece
+        }
+
+        const n = gw * gh,
+          K = N_COLORS,
+          span = Math.max(gw, gh);
+        const f = new Float32Array(n * 5); // r, g, b, x, y
+        for (let i = 0; i < n; i++) {
+          f[i * 5] = px[i * 4];
+          f[i * 5 + 1] = px[i * 4 + 1];
+          f[i * 5 + 2] = px[i * 4 + 2];
+          f[i * 5 + 3] = ((i % gw) / span) * SEG_SPACE;
+          f[i * 5 + 4] = (((i / gw) | 0) / span) * SEG_SPACE;
+        }
+        const weight = [0.9, 1.2, 0.7, 1, 1];
+        const c = new Float32Array(K * 5);
+        const dist = (i, k) => {
+          let d = 0;
+          for (let j = 0; j < 5; j++) {
+            const v = f[i * 5 + j] - c[k * 5 + j];
+            d += v * v * weight[j];
+          }
+          return d;
+        };
+        const setCentre = (k, i) => {
+          for (let j = 0; j < 5; j++) c[k * 5 + j] = f[i * 5 + j];
+        };
+
+        // k-means++ seeding, fixed seed so a photo always splits the same way
+        const rnd = seeded(0x5eed1234 ^ (gw * 73856093) ^ (gh * 19349663));
+        setCentre(0, (rnd() * n) | 0);
+        const D = new Float32Array(n).fill(Infinity);
+        for (let k = 1; k < K; k++) {
+          let total = 0;
+          for (let i = 0; i < n; i++) {
+            D[i] = Math.min(D[i], dist(i, k - 1));
+            total += D[i];
+          }
+          let pick = rnd() * total,
+            i = 0;
+          while (i < n - 1 && (pick -= D[i]) > 0) i++;
+          setCentre(k, i);
+        }
+
+        let labels = new Uint8Array(n);
+        const sum = new Float64Array(K * 6);
+        for (let it = 0; it < 12; it++) {
+          sum.fill(0);
+          let far = 0,
+            farD = -1;
+          for (let i = 0; i < n; i++) {
+            let best = 0,
+              bestD = Infinity;
+            for (let k = 0; k < K; k++) {
+              const d = dist(i, k);
+              if (d < bestD) {
+                bestD = d;
+                best = k;
+              }
+            }
+            labels[i] = best;
+            if (bestD > farD) {
+              farD = bestD;
+              far = i;
+            }
+            for (let j = 0; j < 5; j++) sum[best * 6 + j] += f[i * 5 + j];
+            sum[best * 6 + 5]++;
+          }
+          for (let k = 0; k < K; k++) {
+            const m = sum[k * 6 + 5];
+            if (!m) setCentre(k, far);
+            else for (let j = 0; j < 5; j++) c[k * 5 + j] = sum[k * 6 + j] / m;
+          }
+        }
+        labels = majority(labels, gw, gh, K, 4);
+
+        const acc = Array.from({ length: K }, () => [0, 0, 0, 0]);
+        for (let i = 0; i < n; i++) {
+          const a = acc[labels[i]];
+          a[0] += px[i * 4];
+          a[1] += px[i * 4 + 1];
+          a[2] += px[i * 4 + 2];
+          a[3]++;
+        }
+        const colors = acc.map(([r, g, b, m]) => [
+          r / (m || 1),
+          g / (m || 1),
+          b / (m || 1),
+        ]);
+        const luma = ([r, g, b]) => 0.2126 * r + 0.7152 * g + 0.0722 * b;
+        const order = colors
+          .map((_, k) => k)
+          .sort((a, b) => luma(colors[a]) - luma(colors[b]));
+        const rankOf = new Uint8Array(K);
+        order.forEach((k, r) => (rankOf[k] = r));
+        for (let i = 0; i < n; i++) labels[i] = rankOf[labels[i]];
+        return { gw, gh, labels, colors: order.map((k) => colors[k]) };
+      }
+
+      // 3x3 majority vote, so sections are regions rather than speckle
+      function majority(src, gw, gh, K, passes) {
+        let a = src,
+          b = new Uint8Array(src.length);
+        const votes = new Uint8Array(K);
+        for (let p = 0; p < passes; p++) {
+          for (let j = 0; j < gh; j++) {
+            for (let i = 0; i < gw; i++) {
+              votes.fill(0);
+              for (let dj = -1; dj <= 1; dj++) {
+                for (let di = -1; di <= 1; di++) {
+                  votes[
+                    a[clamp(j + dj, 0, gh - 1) * gw + clamp(i + di, 0, gw - 1)]
+                  ]++;
+                }
+              }
+              let best = a[j * gw + i];
+              for (let k = 0; k < K; k++) if (votes[k] > votes[best]) best = k;
+              b[j * gw + i] = best;
+            }
+          }
+          [a, b] = [b, a];
+        }
+        return a;
+      }
+
+      function objectGrid(r, gw, gh) {
+        const cv = makeCanvas(r.w, r.h);
+        const g = cv.getContext("2d");
+        const img = g.createImageData(r.w, r.h);
+        for (let i = 0; i < r.ids.length; i++) {
+          img.data[i * 4] = r.ids[i];
+          img.data[i * 4 + 3] = 255;
+        }
+        g.putImageData(img, 0, 0);
+        const small = makeCanvas(gw, gh).getContext("2d", {
+          willReadFrequently: true,
+        });
+        small.imageSmoothingEnabled = false; // ids, not values
+        small.drawImage(cv, 0, 0, gw, gh);
+        const px = small.getImageData(0, 0, gw, gh).data;
+        const labels = new Uint8Array(gw * gh);
+        for (let i = 0; i < labels.length; i++) labels[i] = px[i * 4];
+
+        const segs = r.segs;
+        const isThing = (k) => (THINGS.has(segs[k].label) ? 1 : 0);
+        const order = segs
+          .map((_, k) => k)
+          .sort(
+            (a, b) => isThing(a) - isThing(b) || segs[b].area - segs[a].area,
+          );
+        const rankOf = new Uint8Array(256); // 255 = nothing detected, stays at the back
+        const thing = new Uint8Array(256);
+        order.forEach((k, i) => {
+          rankOf[k] = Math.max(
+            0,
+            Math.min(
+              N_COLORS - 1,
+              Math.floor(((i + 1) / order.length) * N_COLORS - 1e-6),
+            ),
+          );
+          thing[k] = isThing(k);
+        });
+        return { labels, rankOf, thing };
+      }
+
+      function neighbours(q, gw, gh) {
+        const i = q % gw,
+          j = (q / gw) | 0,
+          out = [];
+        if (i > 0) out.push(q - 1);
+        if (i < gw - 1) out.push(q + 1);
+        if (j > 0) out.push(q - gw);
+        if (j < gh - 1) out.push(q + gw);
+        return out;
+      }
+
+      function cutPhoto(p, size) {
+        if (!p.seg) p.seg = segment(p.img);
+        if (p.rawObjects && !p.objects)
+          p.objects = objectGrid(p.rawObjects, p.seg.gw, p.seg.gh);
+        const key = `${size}:${W}x${H}:${p.objects ? "obj" : "col"}`;
+        if (p.cuts.has(key)) return p.cuts.get(key);
+
+        const full = photoRect(p.img, 1);
+        const crop = photoRect(p.img, size);
+        const pw = Math.max(2, Math.round(full.w)),
+          ph = Math.max(2, Math.round(full.h));
+        if (!p.full || p.full.width !== pw || p.full.height !== ph) {
+          p.full = makeCanvas(pw, ph);
+          const g = p.full.getContext("2d");
+          g.imageSmoothingQuality = "high";
+          g.drawImage(p.img, 0, 0, pw, ph);
+        }
+        const k = full.w / pw;
+        const X0 = (crop.x - full.x) / k,
+          X1 = X0 + crop.w / k;
+        const Y0 = (crop.y - full.y) / k,
+          Y1 = Y0 + crop.h / k;
+
+        const { gw, gh } = p.seg;
+        const obj = p.objects;
+        const labels = obj ? obj.labels : p.seg.labels;
+        const n = gw * gh;
+        const inCrop = (q) => {
+          const x = (((q % gw) + 0.5) / gw) * pw,
+            y = ((((q / gw) | 0) + 0.5) / gh) * ph;
+          return x >= X0 && x <= X1 && y >= Y0 && y <= Y1;
+        };
+
+        // connected patches
+        const comp = new Int32Array(n).fill(-1);
+        const cells = [],
+          labelOf = [];
+        let total = 0;
+        for (let s = 0; s < n; s++) {
+          if (comp[s] !== -1) continue;
+          if (!inCrop(s)) {
+            comp[s] = -2;
+            continue;
+          }
+          const L = labels[s],
+            id = cells.length,
+            list = [s],
+            stack = [s];
+          comp[s] = id;
+          while (stack.length) {
+            for (const t of neighbours(stack.pop(), gw, gh)) {
+              if (comp[t] !== -1 || labels[t] !== L || !inCrop(t)) continue;
+              comp[t] = id;
+              stack.push(t);
+              list.push(t);
+            }
+          }
+          total += list.length;
+          cells.push(list);
+          labelOf.push(L);
+        }
+
+        // fold small patches into neighbours; the main body of a real object is kept
+        const area = cells.map((l) => l.length);
+        const minArea = Math.max(6, MIN_PIECE * total);
+        const keep = new Uint8Array(cells.length);
+        if (obj) {
+          const biggest = new Map();
+          cells.forEach((_, c) => {
+            const L = labelOf[c];
+            if (
+              L !== 255 &&
+              obj.thing[L] &&
+              (!biggest.has(L) || area[c] > area[biggest.get(L)])
+            )
+              biggest.set(L, c);
+          });
+          for (const c of biggest.values())
+            if (area[c] >= minArea * 0.25) keep[c] = 1;
+        }
+        let live = cells.length;
+        for (const c of cells
+          .map((_, i) => i)
+          .sort((a, b) => area[a] - area[b])) {
+          if (!cells[c] || keep[c]) continue;
+          if (area[c] >= minArea && live <= MAX_PIECES) break;
+          const votes = new Map();
+          for (const q of cells[c]) {
+            for (const t of neighbours(q, gw, gh)) {
+              const o = comp[t];
+              if (o >= 0 && o !== c) votes.set(o, (votes.get(o) || 0) + 1);
+            }
+          }
+          if (!votes.size) continue;
+          const into = [...votes].sort((a, b) => b[1] - a[1])[0][0];
+          for (const q of cells[c]) comp[q] = into;
+          cells[into] = cells[into].concat(cells[c]);
+          area[into] += area[c];
+          cells[c] = null;
+          live--;
+        }
+
+        // one canvas per piece: the photo showing through the piece's shape
+        const rnd = seeded(
+          0x2545f491 ^
+            Math.imul(photos.indexOf(p) + 1, 40503) ^
+            Math.imul(size * 100, 2654435761),
+        );
+        const sharp = Math.max(1, pw / gw / 1.6);
+        const pieces = [];
+        cells.forEach((list, c) => {
+          if (!list) return;
+          let i0 = gw,
+            i1 = 0,
+            j0 = gh,
+            j1 = 0;
+          for (const q of list) {
+            const i = q % gw,
+              j = (q / gw) | 0;
+            i0 = Math.min(i0, i);
+            i1 = Math.max(i1, i);
+            j0 = Math.min(j0, j);
+            j1 = Math.max(j1, j);
+          }
+          const x0 = clamp(
+            Math.max(Math.floor(X0), Math.floor(((i0 - 0.5) * pw) / gw)),
+            0,
+            pw - 1,
+          );
+          const x1 = clamp(
+            Math.min(Math.ceil(X1), Math.ceil(((i1 + 1.5) * pw) / gw)),
+            0,
+            pw - 1,
+          );
+          const y0 = clamp(
+            Math.max(Math.floor(Y0), Math.floor(((j0 - 0.5) * ph) / gh)),
+            0,
+            ph - 1,
+          );
+          const y1 = clamp(
+            Math.min(Math.ceil(Y1), Math.ceil(((j1 + 1.5) * ph) / gh)),
+            0,
+            ph - 1,
+          );
+          const bw = x1 - x0 + 1,
+            bh = y1 - y0 + 1;
+          if (bw < 2 || bh < 2) return;
+
+          const pic = makeCanvas(bw, bh);
+          const g = pic.getContext("2d");
+          const mask = g.createImageData(bw, bh);
+          let any = false;
+          for (let y = 0; y < bh; y++) {
+            const py = y0 + y;
+            const ry = clamp(Math.min(py + 1, Y1) - Math.max(py, Y0), 0, 1);
+            if (ry <= 0) continue;
+            const fy = clamp(((py + 0.5) / ph) * gh - 0.5, 0, gh - 1);
+            const r0 = (fy | 0) * gw,
+              r1 = Math.min(gh - 1, (fy | 0) + 1) * gw,
+              ty = fy - (fy | 0);
+            for (let x = 0; x < bw; x++) {
+              const px = x0 + x;
+              const rx = clamp(Math.min(px + 1, X1) - Math.max(px, X0), 0, 1);
+              if (rx <= 0) continue;
+              const fx = clamp(((px + 0.5) / pw) * gw - 0.5, 0, gw - 1);
+              const a0 = fx | 0,
+                a1 = Math.min(gw - 1, a0 + 1),
+                tx = fx - a0;
+              let cover = 0;
+              if (comp[r0 + a0] === c) cover += (1 - tx) * (1 - ty);
+              if (comp[r0 + a1] === c) cover += tx * (1 - ty);
+              if (comp[r1 + a0] === c) cover += (1 - tx) * ty;
+              if (comp[r1 + a1] === c) cover += tx * ty;
+              if (cover <= 0) continue;
+              const alpha = clamp((cover - 0.5) * sharp + 0.5, 0, 1) * rx * ry;
+              if (alpha <= 0) continue;
+              mask.data[(y * bw + x) * 4 + 3] = alpha * 255;
+              any = true;
+            }
+          }
+          if (!any) return;
+          g.putImageData(mask, 0, 0);
+          g.globalCompositeOperation = "source-in";
+          g.drawImage(p.full, -x0, -y0);
+
+          const rank = obj ? obj.rankOf[labelOf[c]] : labelOf[c];
+          const inAt = (0.6 * rank) / (N_COLORS - 1) + 0.4 * rnd(); // back of the stack lands first
+          pieces.push({
+            pic,
+            rank,
+            x: full.x + x0 * k,
+            y: full.y + y0 * k,
+            w: bw * k,
+            h: bh * k,
+            cx: full.x + (x0 + bw / 2) * k,
+            cy: full.y + (y0 + bh / 2) * k,
+            lead: LEAD[rank] + (rnd() * 2 - 1) * LEAD_JITTER,
+            inAt,
+            outAt: 1 - inAt, // leaving is arriving in reverse
+            q: 0,
+          });
+        });
+
+        const cut = { pieces, crop, full };
+        p.cuts.set(key, cut);
+        return cut;
+      }
+
+      function findObjects() {
+        if (!USE_OBJECTS || typeof Worker === "undefined") return;
+        const src = `
+    import { pipeline, env } from "${OBJECT_LIB}";
+    env.allowLocalModels = false;
+    let segmenter = null, queue = Promise.resolve();
+    async function look({ idx, url }) {
+      try {
+        segmenter ??= await pipeline("image-segmentation", "${OBJECT_MODEL}");
+        const out = await segmenter(url, { threshold: 0.55, subtask: "panoptic" });
+        if (!out?.length) return postMessage({ idx, ok: false });
+        const w = out[0].mask.width, h = out[0].mask.height;
+        const ids = new Uint8Array(w * h).fill(255), segs = [];
+        out.slice(0, 250).forEach((o, k) => {
+          const ch = o.mask.channels || 1, d = o.mask.data;
+          let area = 0;
+          for (let i = 0; i < w * h; i++) if (d[i * ch] > 127) { ids[i] = k; area++; }
+          segs.push({ label: o.label || "", area });
+        });
+        postMessage({ idx, ok: true, w, h, ids, segs }, [ids.buffer]);
+      } catch (e) {
+        postMessage({ idx, ok: false, err: String(e?.message || e) });
+      }
+    }
+    onmessage = (e) => { queue = queue.then(() => look(e.data)); };
+  `;
+        let worker;
+        try {
+          worker = new Worker(
+            URL.createObjectURL(new Blob([src], { type: "text/javascript" })),
+            { type: "module" },
+          );
+        } catch {
+          return;
+        }
+        worker.onerror = () => worker.terminate();
+        worker.onmessage = ({ data }) => {
+          if (!data.ok) return;
+          const p = photos[data.idx];
+          p.rawObjects = data;
+          p.objects = null;
+          p.cuts.clear();
+          console.info(
+            "objects in photo",
+            data.idx,
+            data.segs.map((s) => s.label).join(", "),
+          );
+        };
+        PHOTOS.forEach((url, idx) =>
+          worker.postMessage({ idx, url: sized(url, 800) }),
+        );
+      }
+
+      function drawPieces(g, cut, dir, bias) {
+        const { pieces, crop } = cut;
+        const ax = Math.cos(angle),
+          ay = Math.sin(angle);
+        const ext = 0.5 * (Math.abs(ax) * crop.w + Math.abs(ay) * crop.h);
+        const ox = crop.x + crop.w / 2 - dir * ax * ext;
+        const oy = crop.y + crop.h / 2 - dir * ay * ext;
+        const carryDist = Math.hypot(W, H) * CARRY;
+
+        for (const pc of pieces
+          .slice()
+          .sort((a, b) => a.q - b.q || a.rank - b.rank)) {
+          const q = pc.q;
+          const a = 1 - smootherstep(clamp((q - 0.92) / 0.08, 0, 1));
+          if (a <= 0.003) continue;
+          if (q < 0.0005) {
+            g.globalAlpha = a;
+            g.drawImage(pc.pic, pc.x, pc.y, pc.w, pc.h);
+            continue;
+          }
+          const lead = pc.lead * LEAD_SPREAD + bias;
+          const slide = dir * Math.abs(lead) * SLIDE * q * H;
+          const side = dir * lead * FAN * q * H;
+          const tip =
+            1 +
+            STRETCH * q * (0.55 + 0.45 * Math.min(1, Math.abs(lead))) +
+            PAGE_STRETCH * q ** STRETCH_POW;
+          const carry =
+            dir *
+            carryDist *
+            smootherstep(clamp((q - LET_GO) / (1 - LET_GO), 0, 1));
+          const wobble = WOBBLE * H * q;
+          const phase = pc.rank * 1.7 + pc.cx * 0.013;
+          const reach =
+            Math.abs(slide) + Math.abs(side) + (tip - 1) * Math.max(pc.w, pc.h);
+          const steps = clamp(Math.ceil(reach / COPY_STEP), 1, MAX_COPIES);
+
+          const copy = (t, taper, alpha) => {
+            const along = 1 + (tip - 1) * t;
+            const across = (1 - taper * TAPER * t * t) / along ** NECK;
+            const d = slide * t + carry;
+            const s =
+              side * t + dir * Math.sin(t * Math.PI * 1.6 + phase) * wobble * t;
+            g.save();
+            g.translate(ox + ax * d - ay * s, oy + ay * d + ax * s);
+            g.rotate(angle);
+            g.scale(along, across);
+            g.rotate(-angle);
+            g.translate(-ox, -oy);
+            g.globalAlpha = alpha;
+            g.drawImage(pc.pic, pc.x, pc.y, pc.w, pc.h);
+            g.restore();
+          };
+
+          const home =
+            1 - smootherstep(clamp((q - ANCHOR) / (1 - ANCHOR), 0, 1));
+          if (home > 0.003) copy(0, 0, a * home);
+          for (let i = 1; i < steps; i++)
+            copy(i / steps, 1, a * COPY_ALPHA * (1 - (0.5 * i) / steps));
+          copy(
+            1,
+            0,
+            a * (0.25 + 0.5 * smoothstep(clamp((q - 0.35) / 0.4, 0, 1))),
+          );
+        }
+        g.globalAlpha = 1;
+      }
+
+      function bakeThreads() {
+        const s = Math.max(8, Math.round(2 * maskR * MASK_RES));
+        threads.width = threads.height = s;
+        mask.width = mask.height = s;
+        const g = threads.getContext("2d");
+        const img = g.createImageData(s, s);
+        const c = s / 2,
+          unit = H * MASK_RES;
+        for (let y = 0; y < s; y++) {
+          for (let x = 0; x < s; x++) {
+            const along = (x + 0.5 - c) / unit,
+              across = (y + 0.5 - c) / unit;
+            const v = fbm(across * 13, along * 13 * 0.17);
+            const edge = 0.34 + 0.32 * clamp(Math.abs(along) / 0.55, 0, 1);
+            const strand = smoothstep(clamp((v - edge) / 0.32, 0, 1));
+            const soft = clamp(0.7 + 1.15 * (v - edge), 0, 1);
+            img.data[(y * s + x) * 4 + 3] =
+              clamp(0.84 * soft + 0.16 * strand, 0, 1) * 255;
+          }
+        }
+        g.putImageData(img, 0, 0);
+        fade = g.createRadialGradient(
+          c,
+          c,
+          FADE_IN * unit,
+          c,
+          c,
+          FADE_OUT * unit,
+        );
+        fade.addColorStop(0, "#000");
+        fade.addColorStop(1, "rgba(0,0,0,0)");
+        maskKey = "";
+      }
+
+      // pull 0 = solid, 1 = full threads
+      function updateMask(pull, wide) {
+        const key = pull.toFixed(3) + ":" + wide;
+        if (key === maskKey) return;
+        maskKey = key;
+        const g = mask.getContext("2d"),
+          s = mask.width,
+          c = s / 2;
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.globalCompositeOperation = "copy";
+        g.fillStyle = `rgba(0,0,0,${1 - pull})`;
+        g.fillRect(0, 0, s, s);
+        g.globalCompositeOperation = "lighter";
+        g.globalAlpha = pull;
+        g.drawImage(threads, 0, 0);
+        g.globalAlpha = 1;
+        g.globalCompositeOperation = "destination-in";
+        g.translate(c, c);
+        g.scale(FADE_LONG * wide, wide);
+        g.translate(-c, -c);
+        g.fillStyle = fade;
+        g.fillRect(c - 6 * s, c - 6 * s, 12 * s, 12 * s);
+        g.setTransform(1, 0, 0, 1, 0, 0);
+        g.globalCompositeOperation = "source-over";
+      }
+
+      // ---------- loop ----------
+
+      const canvas = document.getElementById("stage");
+      const ctx = canvas.getContext("2d", { alpha: false });
+      const trail = makeCanvas(1, 1),
+        tctx = trail.getContext("2d");
+      const frameCv = makeCanvas(1, 1),
+        fctx = frameCv.getContext("2d");
+      const threads = makeCanvas(1, 1),
+        mask = makeCanvas(1, 1);
+      let W = 1,
+        H = 1,
+        angle = 0,
+        maskR = 1,
+        fade = null,
+        maskKey = "";
+      let current = null,
+        photoIndex = Math.floor(Math.random() * PHOTOS.length) - 1,
+        sizeIndex = -1;
+      let cycleStart = 0,
+        lastFrame = 0;
+
+      function resize() {
+        W = innerWidth;
+        H = innerHeight;
+        for (const c of [canvas, trail, frameCv]) {
+          c.width = W;
+          c.height = H;
+        }
+        angle = Math.atan2(H, -W); // top right to bottom left
+        maskR = Math.hypot(W / 2, H / 2) * 1.02;
+        bakeThreads();
+        photos.forEach((p) => p.cuts.clear());
+        if (current) current.cut = cutPhoto(current.photo, current.size);
+      }
+
+      function nextPhoto() {
+        for (let k = 1; k <= photos.length; k++) {
+          const i = (photoIndex + k + photos.length) % photos.length;
+          if (photos[i].ready) {
+            photoIndex = i;
+            return photos[i];
+          }
+        }
+        return null;
+      }
+
+      function startCycle() {
+        const photo = nextPhoto();
+        if (!photo) {
+          current = null;
+          return;
+        }
+        sizeIndex = (sizeIndex + 1) % SIZES.length;
+        const size = SIZES[sizeIndex];
+        current = {
+          photo,
+          size,
+          bias: BIAS[sizeIndex],
+          cut: cutPhoto(photo, size),
+        };
+        setOverlayColors(photo.seg.colors);
+      }
+
+      function render(t, dt) {
+        ctx.fillStyle = BG;
+        ctx.fillRect(0, 0, W, H);
+        if (!current) return;
+        const { cut, bias } = current;
+        let dir = 1,
+          pull = 0,
+          wide = FADE_WIDE,
+          keep = TRAIL_KEEP,
+          photoAlpha = 0;
+
+        if (t < IN_S) {
+          const u = t / IN_S;
+          dir = -1;
+          for (const pc of cut.pieces)
+            pc.q =
+              1 - smootherstep(clamp((u - pc.inAt * STAGGER) / TRAVEL, 0, 1));
+          pull = Math.min(
+            1,
+            1.7 * (1 - smootherstep(clamp((u - 0.55) / 0.45, 0, 1))),
+          );
+        } else if (t < IN_S + HOLD_S) {
+          const u = (t - IN_S) / HOLD_S;
+          for (const pc of cut.pieces) pc.q = 0;
+          wide = 1;
+          keep =
+            TRAIL_KEEP +
+            (TRAIL_SETTLE - TRAIL_KEEP) *
+              (1 - smootherstep(clamp(u / 0.34, 0, 1)));
+          photoAlpha =
+            smootherstep(clamp(u / 0.16, 0, 1)) *
+            (1 - smootherstep(clamp((u - 0.9) / 0.1, 0, 1)));
+        } else {
+          const u = (t - IN_S - HOLD_S) / OUT_S;
+          for (const pc of cut.pieces)
+            pc.q = smootherstep(clamp((u - pc.outAt * STAGGER) / TRAVEL, 0, 1));
+          pull = Math.min(1, 1.7 * smootherstep(clamp(u / 0.45, 0, 1)));
+        }
+
+        // the trail is never cleared, only faded, so anything that moves leaves a smear
+        tctx.globalCompositeOperation = "destination-out";
+        tctx.fillStyle = `rgba(0,0,0,${1 - keep ** (dt * 60)})`;
+        tctx.fillRect(0, 0, W, H);
+        tctx.globalCompositeOperation = "source-over";
+        drawPieces(tctx, cut, dir, bias);
+
+        updateMask(pull, wide);
+        fctx.globalCompositeOperation = "copy";
+        fctx.drawImage(trail, 0, 0);
+        fctx.globalCompositeOperation = "destination-in";
+        fctx.save();
+        fctx.translate(W / 2, H / 2);
+        fctx.rotate(angle);
+        fctx.drawImage(mask, -maskR, -maskR, 2 * maskR, 2 * maskR);
+        fctx.restore();
+        fctx.globalCompositeOperation = "source-over";
+        ctx.drawImage(frameCv, 0, 0);
+
+        // once landed, the plain photo sits on top to hide the seams between pieces
+        if (photoAlpha > 0.001) {
+          const { crop, full } = cut;
+          ctx.save();
+          ctx.beginPath();
+          ctx.rect(crop.x, crop.y, crop.w, crop.h);
+          ctx.clip();
+          ctx.globalAlpha = photoAlpha;
+          ctx.drawImage(current.photo.full, full.x, full.y, full.w, full.h);
+          ctx.restore();
+        }
+      }
+
+      function frame(now) {
+        requestAnimationFrame(frame);
+        if (document.hidden) return;
+        const dt = Math.min(0.1, (now - lastFrame) / 1000);
+        lastFrame = now;
+        let t = (now - cycleStart) / 1000;
+        if (!current || t >= IN_S + HOLD_S + OUT_S) {
+          const before = performance.now();
+          startCycle();
+          // cutting a new photo takes a moment; start its clock after that, not before
+          cycleStart = now + (performance.now() - before);
+          t = 0;
+        }
+        render(t, dt);
+      }
+
+      // ---------- overlay ----------
+
+      // A faint moving thread pattern over everything, tinted with the current photo's colours.
+      let setOverlayColors = () => {};
+
+      (function overlay() {
+        const cv = document.getElementById("overlay");
+        const gl = cv.getContext("webgl", {
+          alpha: true,
+          premultipliedAlpha: false,
+        });
+        if (!gl) {
+          cv.remove();
+          return;
+        }
+        const vert = `
+    attribute vec2 position;
+    varying vec2 uv;
+    void main() { uv = position * .5 + .5; gl_Position = vec4(position, 0., 1.); }`;
+        const frag = `
+    precision highp float;
+    uniform float time;
+    uniform vec3 pal[7];
+    varying vec2 uv;
+    float hash(vec3 p) { p = fract(p * .1031); p += dot(p, p.yzx + 33.33); return fract((p.x + p.y) * p.z); }
+    float noise(vec3 p) {
+      vec3 i = floor(p), f = fract(p);
+      f = f * f * (3. - 2. * f);
+      return mix(mix(mix(hash(i), hash(i + vec3(1,0,0)), f.x), mix(hash(i + vec3(0,1,0)), hash(i + vec3(1,1,0)), f.x), f.y),
+                 mix(mix(hash(i + vec3(0,0,1)), hash(i + vec3(1,0,1)), f.x), mix(hash(i + vec3(0,1,1)), hash(i + vec3(1,1,1)), f.x), f.y), f.z);
+    }
+    vec3 colour(float i) {
+      if (i < 1.) return pal[0]; if (i < 2.) return pal[1]; if (i < 3.) return pal[2];
+      if (i < 4.) return pal[3]; if (i < 5.) return pal[4]; if (i < 6.) return pal[5];
+      return pal[6];
+    }
+    void main() {
+      float field = 15. * fract(uv.x * uv.x * 10000. + time * .5) + 15. * fract(uv.y * uv.y * 10000. + time * .5);
+      float n = noise(vec3(uv * max(field, .001), time * .35));
+      field -= pow(abs(field - n), 4.) * abs(sin(time * 2.)) * .00004;
+      float m = pow(clamp(1. - field, 0., 1.), .58);
+      gl_FragColor = vec4(colour(floor(fract(uv.x * .71 + uv.y * .43 + time * .025 + n * .18) * 7.)), m * .62);
+    }`;
+        const program = gl.createProgram();
+        for (const [type, src] of [
+          [gl.VERTEX_SHADER, vert],
+          [gl.FRAGMENT_SHADER, frag],
+        ]) {
+          const s = gl.createShader(type);
+          gl.shaderSource(s, src);
+          gl.compileShader(s);
+          gl.attachShader(program, s);
+        }
+        gl.linkProgram(program);
+        gl.useProgram(program);
+        gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+        gl.bufferData(
+          gl.ARRAY_BUFFER,
+          new Float32Array([-1, -1, 3, -1, -1, 3]),
+          gl.STATIC_DRAW,
+        );
+        const pos = gl.getAttribLocation(program, "position");
+        gl.enableVertexAttribArray(pos);
+        gl.vertexAttribPointer(pos, 2, gl.FLOAT, false, 0, 0);
+        const time = gl.getUniformLocation(program, "time");
+        const pal = gl.getUniformLocation(program, "pal");
+        const setPalette = (rgb) =>
+          gl.uniform3fv(pal, new Float32Array(rgb.flat().map((v) => v / 255)));
+        setPalette([
+          [74, 114, 216],
+          [180, 70, 47],
+          [230, 148, 51],
+          [143, 176, 234],
+          [217, 122, 146],
+          [51, 18, 28],
+          [217, 122, 146],
+        ]);
+        setOverlayColors = (rgb) => rgb && rgb.length >= 7 && setPalette(rgb);
+
+        (function draw(now) {
+          requestAnimationFrame(draw);
+          const w = Math.round(
+            innerWidth * Math.min(devicePixelRatio || 1, 1.5),
+          );
+          const h = Math.round(
+            innerHeight * Math.min(devicePixelRatio || 1, 1.5),
+          );
+          if (cv.width !== w || cv.height !== h) {
+            cv.width = w;
+            cv.height = h;
+          }
+          gl.viewport(0, 0, w, h);
+          gl.uniform1f(time, now / 1000);
+          gl.drawArrays(gl.TRIANGLES, 0, 3);
+        })(0);
+      })();
+
+      resize();
+      addEventListener("resize", resize);
+      findObjects();
+      requestAnimationFrame((now) => {
+        lastFrame = now;
+        frame(now);
+      });
+    </script>
+  </body>
+</html>
